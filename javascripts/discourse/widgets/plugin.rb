@@ -1,17 +1,16 @@
 # frozen_string_literal: true
 
 # name: discourse-dice-server
-# about: Server-side deterministic dice roller for Discourse (replaces deprecated client-side widgets)
-# version: 1.1.0
-# authors: Adapted for server-side Glimmer-compatible rendering
-# url: https://your-repo-if-any
+# about: Server-side deterministic dice roller for Discourse (Glimmer-compatible replacement for deprecated widgets)
+# version: 1.2.1
+# authors: Community / Adapted for server-side
+# url: https://github.com/your-repo-if-any
 
-# This plugin processes [wrap=dice] BBCode during post cooking.
-# Core Discourse turns [wrap=dice crit="..."]expression[/wrap] into:
-# <div class="d-wrap" data-wrap="dice" data-crit="...">expression</div>
-# This plugin replaces those divs with the fully rendered dice roll (or errors/input only in preview).
+require 'nokogiri'
 
 SEED_CONSTANT = 843031067
+MAX_QUANTITY = 100
+MAX_FACES = 1_000_000
 
 class MersenneTwister19937
   N = 624
@@ -112,20 +111,19 @@ def parse_dice(match, expression)
 
   quantity = match[1] ? match[1].to_i : 1
   faces = match[2]&.to_i
-
   mod_sign = match[3]
   mod_val = match[4]&.to_i
   threshold = match[5]&.to_i
   individual = !match[6].nil?
 
   errors << "Quantity must be positive" if quantity <= 0
-  errors << "Too many dice (max 100)" if quantity > 100
+  errors << "Too many dice (max #{MAX_QUANTITY})" if quantity > MAX_QUANTITY
 
   if faces.nil?
     errors << "Missing number of faces"
   elsif faces <= 1
     errors << "Faces must be > 1"
-  elsif faces > 1_000_000
+  elsif faces > MAX_FACES
     errors << "Too many faces"
   end
 
@@ -269,48 +267,54 @@ def render_dice_roll(attrs)
 end
 
 after_initialize do
-  class ::PrettyText
-    class << self
+  module ::DiscourseDice
+    module Cooker
       def cook(raw, opts = {})
         cooked = super(raw, opts)
 
-        post = opts[:post]
         return cooked unless cooked.include?('data-wrap="dice"')
 
-        fragment = Nokogiri::HTML::DocumentFragment.parse(cooked)
-        placeholders = fragment.css('div.d-wrap[data-wrap="dice"]')
+        doc = Nokogiri::HTML::DocumentFragment.parse(cooked)
+        placeholders = doc.css('div.d-wrap[data-wrap="dice"]')
         return cooked if placeholders.empty?
 
+        post = opts[:post]
         mt = nil
-        seen_errors = false
+        seen_error = false
 
         if post
-          seed_str = "#{post.id} #{post.created_at.iso8601}"
-          seed = MurmurHash3.x86_32(seed_str, SEED_CONSTANT)
+          seed_string = "#{post.id} #{post.created_at.iso8601}"
+          seed = MurmurHash3.x86_32(seed_string, SEED_CONSTANT)
           mt = MersenneTwister19937.new(seed)
         end
 
-        placeholders.each do |elem|
-          expression = elem.content.strip
-          crit_str = elem['data-crit']
+        placeholders.each do |placeholder|
+          expression = placeholder.content.strip
+          crit_str = placeholder['data-crit']
 
           match = DICE_REGEXP.match(expression)
           attrs = parse_dice(match, expression)
           attrs = parse_crits(crit_str, attrs)
 
           if mt
-            if seen_errors && attrs[:errors].empty?
+            if seen_error && attrs[:errors].empty?
               attrs[:errors] << "Halted due to previous error in post"
             end
+
             roll_dice(mt, attrs) if attrs[:errors].empty?
-            seen_errors = true if attrs[:errors].any?
+
+            seen_error = true if attrs[:errors].any?
           end
 
-          elem.replace(render_dice_roll(attrs))
+          new_html = render_dice_roll(attrs)
+          new_fragment = Nokogiri::HTML.fragment(new_html)
+          placeholder.replace(new_fragment)
         end
 
-        fragment.to_html
+        doc.to_html
       end
     end
   end
+
+  PrettyText.singleton_class.prepend ::DiscourseDice::Cooker
 end
